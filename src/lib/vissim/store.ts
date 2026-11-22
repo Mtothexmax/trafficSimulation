@@ -15,6 +15,9 @@ export interface StoredController {
 	program: UploadedProgram;
 	/** was the controller program running when the page was left? */
 	active: boolean;
+	/** the signal program number and the start time chosen for it */
+	progNo?: number;
+	startAt?: string;
 }
 
 const DB = 'trafficSimulation';

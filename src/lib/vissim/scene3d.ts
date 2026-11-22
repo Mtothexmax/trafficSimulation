@@ -21,7 +21,7 @@ const C = {
 	steel: '#8a9097',
 	housing: '#17181a',
 	loop: '#3f4347',
-	occupied: '#ffcc00'
+	occupied: '#c9a83a'
 };
 const LAMP_ON = { red: '#ff3b30', amber: '#ffcc00', green: '#30d158' };
 const LAMP_OFF = { red: '#3a1513', amber: '#3a3010', green: '#123a1c' };
@@ -286,7 +286,7 @@ export class Scene3D {
 			const b = d.pos + Math.max(d.length, 0.5);
 			// the loop as a thin frame, and a highlight that shows while it is occupied
 			frame.push(...strip(rl, off + half, off + half - t, a, b), ...strip(rl, off - half + t, off - half, a, b), ...strip(rl, off + half, off - half, a, a + t), ...strip(rl, off + half, off - half, b - t, b));
-			const mesh = this.add(quadGeometry(strip(rl, off + half, off - half, a, b), 0.02), new THREE.MeshBasicMaterial({ color: C.occupied, transparent: true, opacity: 0.55, depthTest: false, depthWrite: false }), ORDER.loop + 0.5);
+			const mesh = this.add(quadGeometry(strip(rl, off + half, off - half, a, b), 0.02), new THREE.MeshBasicMaterial({ color: C.occupied, depthTest: false, depthWrite: false }), ORDER.loop + 0.5);
 			mesh.visible = false;
 			this.loops.push({ no: d.no, mesh });
 		}
@@ -350,7 +350,8 @@ export class Scene3D {
 			const { front, rear } = sim!.pose(v);
 			q.setFromAxisAngle(up, Math.atan2(front.y - rear.y, front.x - rear.x));
 			pos.set((front.x + rear.x) / 2, 0.02, -(front.y + rear.y) / 2);
-			m.compose(pos, q, scale.set(v.length / modelLength, height, 1));
+			// vehicles are stretched to their length; a person keeps its shape
+			m.compose(pos, q, scale.set(v.category === 'PEDESTRIAN' ? 1 : v.length / modelLength, height, 1));
 		};
 
 		const buckets = new Map<string, Vehicle[]>();

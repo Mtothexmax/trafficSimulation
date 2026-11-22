@@ -6,6 +6,8 @@ import { groupState, parseSig } from './sig';
 import { buildRuntime, laneKey, lanePose, Polyline } from './net';
 import { quantile, Simulation, wiedemann74, wiedemann99 } from './sim';
 import { CODE, VaBridge, type Triple } from './va';
+import { defaultStartAt } from './transport';
+import { readSignalPrograms } from './supply';
 
 // The tests run on a sample network that is not part of the repository: put a
 // Vissim network and its fixed-time program into static/samples as
@@ -191,7 +193,7 @@ describe.skipIf(!haveSamples)('simulation of the sample network', () => {
 			}
 			// same lane, overlapping bodies
 			const lanes = new Map<number, typeof sim.vehicles>();
-			for (const v of sim.vehicles) lanes.set(laneKey(v.link.no, v.lane), [...(lanes.get(laneKey(v.link.no, v.lane)) ?? []), v]);
+			for (const v of sim.vehicles) if (v.category !== 'PEDESTRIAN') lanes.set(laneKey(v.link.no, v.lane), [...(lanes.get(laneKey(v.link.no, v.lane)) ?? []), v]);
 			for (const l of lanes.values()) {
 				l.sort((a, b) => a.s - b.s);
 				for (let k = 1; k < l.length; k++) if (l[k].s - l[k].length < l[k - 1].s - 0.3) overlaps++;
@@ -233,6 +235,61 @@ describe.skipIf(!haveSamples)('simulation of the sample network', () => {
 	});
 });
 
+describe.skipIf(!haveSamples)('pedestrians', () => {
+	if (!haveSamples) return;
+	const run = (seconds: number, pedestriansPerHour?: number): Simulation => {
+		const sim = new Simulation(buildRuntime(parseInpx(inpx)), [parseSig(sig)], pedestriansPerHour === undefined ? {} : { pedestriansPerHour });
+		for (let i = 0; i < Math.round(seconds / sim.dt); i++) sim.step();
+		return sim;
+	};
+
+	it('finds the footpaths of the network', () => {
+		expect(buildRuntime(parseInpx(inpx)).pedestrianLinks.map((l) => l.no).sort((a, b) => a - b)).toEqual([14, 15, 16, 17, 18, 19]);
+	});
+
+	it('lets pedestrians walk along the footpaths and wait at red', () => {
+		const sim = new Simulation(buildRuntime(parseInpx(inpx)), [parseSig(sig)], { pedestriansPerHour: 600 });
+		const heads = sim.rt.net.signalHeads;
+		const before = new Map<number, number>();
+		let seen = 0;
+		let waiting = 0;
+		let crossedAtRed = 0;
+		let finished = 0;
+		for (let i = 0; i < Math.round(330 / sim.dt); i++) {
+			const ids = new Set(sim.vehicles.filter((v) => v.category === 'PEDESTRIAN').map((v) => v.id));
+			sim.step();
+			for (const v of sim.vehicles) {
+				if (v.category !== 'PEDESTRIAN') continue;
+				ids.delete(v.id);
+				seen = Math.max(seen, v.id);
+				expect(sim.rt.pedestrianLinks).toContain(v.link);
+				const head = heads.find((h) => h.link === v.link.no)!;
+				const state = sim.signals.get(Simulation.signalKey(head.sc, head.sg));
+				if (v.v < 0.05 && v.s < head.pos) waiting++;
+				const prev = before.get(v.id);
+				if (prev !== undefined && prev < head.pos - 0.6 && v.s >= head.pos && state === 'red') crossedAtRed++;
+				before.set(v.id, v.s);
+			}
+			finished += ids.size; // those that reached the end of their footpath
+		}
+		expect(seen).toBeGreaterThan(0);
+		expect(waiting).toBeGreaterThan(0);
+		expect(crossedAtRed).toBe(0);
+		expect(finished).toBeGreaterThan(10);
+	}, 20_000);
+
+	it('does not change the vehicle traffic, and can be switched off', () => {
+		const withPeds = run(200);
+		const without = run(200, 0);
+		const cars = (s: Simulation): number[][] => s.vehicles.filter((v) => v.category !== 'PEDESTRIAN').map((v) => [v.type.no, v.link.no]);
+		expect(without.vehicles.some((v) => v.category === 'PEDESTRIAN')).toBe(false);
+		expect(withPeds.vehicles.some((v) => v.category === 'PEDESTRIAN')).toBe(true);
+		// same vehicles entered in both runs (their own random stream is untouched)
+		expect(withPeds.inputStats.map((s) => s.entered)).toEqual(without.inputStats.map((s) => s.entered));
+		expect(cars(withPeds).length).toBeGreaterThan(0);
+	});
+});
+
 describe.skipIf(!haveSamples)('external traffic-actuated control', () => {
 	if (!haveSamples) return;
 	const make = (): { sim: Simulation; va: VaBridge } => {
@@ -253,6 +310,13 @@ describe.skipIf(!haveSamples)('external traffic-actuated control', () => {
 		expect(setup).toContainEqual([CODE.PROGRAMMNUMMER, 0, 1]);
 		expect(setup).toContainEqual([CODE.T_GELB, 1, 3]);
 		expect(setup.filter((t) => t[0] === CODE.IST_BILD)).toHaveLength(11);
+	});
+
+	it('sends the chosen signal program instead of the one of the network file', () => {
+		const sim = new Simulation(buildRuntime(parseInpx(inpx)), []);
+		const va = new VaBridge(sim, sim.rt.net.controllers[0], 3);
+		expect(va.setup()).toContainEqual([CODE.PROGRAMMNUMMER, 0, 3]);
+		expect(va.input()).toContainEqual([CODE.PROGRAMMNUMMER, 0, 3]);
 	});
 
 	it('adds the transitions to a wanted signal picture, and none when told so', () => {
@@ -318,5 +382,47 @@ describe.skipIf(!haveSamples)('external traffic-actuated control', () => {
 		}
 		expect(sim.collisions).toBe(0);
 		expect(sim.inputStats.reduce((a, st) => a + st.left, 0)).toBeGreaterThan(5);
+	});
+});
+
+describe('start time of the controller clock', () => {
+	it('is the start time of the network on the given day', () => {
+		expect(defaultStartAt(43200, new Date(2026, 10, 18, 9, 30))).toBe('2026-11-18T12:00');
+		expect(defaultStartAt(27030, new Date(2026, 0, 5))).toBe('2026-01-05T07:30');
+		expect(defaultStartAt(0, new Date(2026, 0, 5))).toBe('2026-01-05T00:00');
+	});
+});
+
+describe('signal programs of a supply file', () => {
+	const hex = (bytes: number[]): string => bytes.map((b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+	const block = (no: number, mark: number, name: string): string => {
+		const bytes = new Array<number>(64).fill(0);
+		bytes[4] = no;
+		bytes[6] = mark;
+		[...name].forEach((c, i) => (bytes[26 + i] = c.charCodeAt(0)));
+		return `// AL_sSignalplan Instanz: ${no}
+BOT
+
+Data=${hex(bytes.slice(0, 32))}
+Data=${hex(bytes.slice(32))}
+EOT
+
+`;
+	};
+
+	it('lists the filled slots with their names and leaves out the empty ones', () => {
+		const text = `::Knotennummer=5
+
+// AL_sStammdaten Instanz: 1
+BOT
+Data=7C00
+EOT
+
+${block(1, 0x33, 'SP 1')}${block(2, 0x33, 'Morgenspitze')}${block(3, 0x31, '')}${block(4, 0x33, '')}`;
+		expect(readSignalPrograms(text)).toEqual([{ no: 1, name: 'SP 1' }, { no: 2, name: 'Morgenspitze' }, { no: 4, name: '' }]);
+	});
+
+	it('finds nothing in a file of another kind', () => {
+		expect(readSignalPrograms('<network/>')).toEqual([]);
 	});
 });

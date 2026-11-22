@@ -144,6 +144,14 @@ export function draw(ctx: CanvasRenderingContext2D, width: number, height: numbe
 	if (!sim) return;
 	for (const v of sim.vehicles) {
 		const { front, rear } = sim.pose(v);
+		if (v.category === 'PEDESTRIAN') {
+			// seen from above a person is a dot
+			ctx.beginPath();
+			ctx.arc(X(front.x), Y(front.y), Math.max(2, px(0.28)), 0, Math.PI * 2);
+			ctx.fillStyle = vehicleColor(v);
+			ctx.fill();
+			continue;
+		}
 		const half = v.width / 2;
 		const dx = front.x - rear.x;
 		const dy = front.y - rear.y;

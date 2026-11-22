@@ -37,15 +37,27 @@ export async function readUpload(files: File[]): Promise<UploadedProgram> {
 	};
 }
 
+/** The time of day a network starts at (seconds after midnight) as a value for a
+ * date-and-time field, on today's date. */
+export function defaultStartAt(startTime: number, today = new Date()): string {
+	const s = Math.max(0, Math.floor(startTime)) % 86400;
+	const two = (n: number): string => String(n).padStart(2, '0');
+	return `${today.getFullYear()}-${two(today.getMonth() + 1)}-${two(today.getDate())}T${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}`;
+}
+
 export class EmulatorTransport implements VaTransport {
 	readonly label: string;
 	private worker: Worker | null = null;
 	private nextId = 1;
 	private readonly pending = new Map<number, { resolve: (t: Triple[]) => void; reject: (e: Error) => void }>();
+	/** ends a start that is still waiting for the program */
+	private abortStart: ((e: Error) => void) | null = null;
 
 	constructor(
 		private readonly program: UploadedProgram,
-		private readonly nr: number
+		private readonly nr: number,
+		/** date and time the program's clock shows (local time, as a date-and-time field gives it) */
+		private readonly startAt: string
 	) {
 		this.label = `${program.exe.name} (im Browser emuliert)`;
 	}
@@ -54,6 +66,7 @@ export class EmulatorTransport implements VaTransport {
 		this.stop();
 		const worker = (this.worker = new Worker(new URL('./exe/worker.ts', import.meta.url), { type: 'module' }));
 		return new Promise<string[]>((resolve, reject) => {
+			this.abortStart = reject;
 			worker.onmessage = (e: MessageEvent<WorkerReply>) => {
 				const m = e.data;
 				if (m.type === 'ready') resolve([`Steuerung geladen in ${(m.loadMs / 1000).toFixed(1)} s`, ...m.notes]);
@@ -74,13 +87,17 @@ export class EmulatorTransport implements VaTransport {
 			const files: Record<string, ArrayBuffer> = {};
 			// the worker gets copies: the upload stays usable for a restart
 			for (const f of [...this.program.supply, ...this.program.extra]) files[f.name] = f.data.slice(0);
+			// The program reads the PC clock; it gets the chosen start time, not the real one,
+			// so a run does not depend on when it is made.
+			const parsed = new Date(this.startAt);
+			const at = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 			const request: WorkerRequest = {
 				type: 'start',
 				exe: this.program.exe.data.slice(0),
 				files,
 				commandLine: `${this.nr} ${this.nr} X ${this.program.supply.map((f) => f.name).join(' ')}`,
-				clock: Math.floor(Date.now() / 1000),
-				tz: -new Date().getTimezoneOffset() * 60,
+				clock: Math.floor(at.getTime() / 1000),
+				tz: -at.getTimezoneOffset() * 60,
 				setup
 			};
 			worker.postMessage(request, [request.exe, ...Object.values(files)]);
@@ -100,6 +117,8 @@ export class EmulatorTransport implements VaTransport {
 	stop(): void {
 		this.worker?.terminate();
 		this.worker = null;
+		this.abortStart?.(new Error('Die Steuerung wurde beendet'));
+		this.abortStart = null;
 		for (const p of this.pending.values()) p.reject(new Error('Die Steuerung wurde beendet'));
 		this.pending.clear();
 	}

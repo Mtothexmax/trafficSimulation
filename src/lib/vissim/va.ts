@@ -61,9 +61,11 @@ export class VaBridge {
 	private readonly channels = new Map<number, number[]>();
 	private readonly smoothed = new Map<number, number>();
 
+	/** `progNo`: the signal program the controller is to run (default: the one the network file names) */
 	constructor(
 		private readonly sim: Simulation,
-		readonly controller: SignalController
+		readonly controller: SignalController,
+		readonly progNo: number = controller.progNo
 	) {
 		this.groups = controller.groups.map((g) => ({ no: g.no, state: 'red', since: 0, then: null, amber: g.amber, redAmber: g.redAmber }));
 		for (const d of sim.rt.detectors) {
@@ -79,7 +81,7 @@ export class VaBridge {
 	setup(): Triple[] {
 		const out: Triple[] = [
 			[CODE.UMLAUFZEIT, 0, Math.round(this.controller.cycleTime)],
-			[CODE.PROGRAMMNUMMER, 0, this.controller.progNo]
+			[CODE.PROGRAMMNUMMER, 0, this.progNo]
 		];
 		for (const g of this.controller.groups) {
 			out.push([CODE.IST_BILD, g.no, BILD.red], [CODE.T_GRUEN_MIN, g.no, Math.round(g.minGreen)], [CODE.T_ROT_MIN, g.no, Math.round(g.minRed)], [CODE.T_ROTGELB, g.no, Math.round(g.redAmber)], [CODE.T_GELB, g.no, Math.round(g.amber)]);
@@ -98,7 +100,7 @@ export class VaBridge {
 		const cycle = Math.max(1, Math.round(this.controller.cycleTime));
 		const out: Triple[] = [
 			[CODE.UMLAUFSEKUNDE, 0, Math.floor(t + 1e-6) % cycle],
-			[CODE.PROGRAMMNUMMER, 0, this.controller.progNo]
+			[CODE.PROGRAMMNUMMER, 0, this.progNo]
 		];
 		for (const g of this.groups) out.push([CODE.IST_BILD, g.no, BILD[g.state]], [CODE.LAUFZEIT, g.no, Math.floor(t - g.since)]);
 		for (const [channel, numbers] of this.channels) {

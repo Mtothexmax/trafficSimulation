@@ -4,11 +4,12 @@
 	import { parseInpx } from '../lib/vissim/inpx';
 	import { parseSig, type SigFile, type SignalState } from '../lib/vissim/sig';
 	import { buildRuntime, type Runtime } from '../lib/vissim/net';
-	import { Simulation } from '../lib/vissim/sim';
+	import { DEFAULT_PEDESTRIANS_PER_HOUR, Simulation } from '../lib/vissim/sim';
 	import { draw, fitView, SIGNAL_COLORS, type View } from '../lib/vissim/render';
 	import { Scene3D } from '../lib/vissim/scene3d';
 	import { VaBridge } from '../lib/vissim/va';
-	import { EmulatorTransport, readUpload, type UploadedProgram, type VaTransport } from '../lib/vissim/transport';
+	import { readSignalProgramsOf, type SupplyProgram } from '../lib/vissim/supply';
+	import { defaultStartAt, EmulatorTransport, readUpload, type UploadedProgram, type VaTransport } from '../lib/vissim/transport';
 	import { asset } from '$app/paths';
 	import { recall, remember } from '../lib/vissim/store';
 	import InflowCharts, { type InflowSample } from '../lib/components/InflowCharts.svelte';
@@ -48,8 +49,17 @@
 	let transport: VaTransport | null = null;
 	let vaLabel = $state('');
 	let vaNotes = $state<string[]>([]);
+	/** signal controllers without a program: their signal heads are ignored */
+	let noProgram = $state(false);
 	let upload: UploadedProgram | null = null;
 	let uploadNames = $state('');
+	/** the signal program the controller is to run, and the date and time its clock shows */
+	let vaProgNo = $state(1);
+	/** the signal programs the uploaded supply file defines (none: not readable, free entry) */
+	let vaPrograms = $state<SupplyProgram[]>([]);
+	let vaStartAt = $state('');
+	/** what the network file gives for the two */
+	let vaDefaults = $state({ progNo: 1, startAt: '' });
 	/** the signal program files as opened, kept for the reload */
 	let sigTextsOpen: string[] = [];
 	/** restoring the files of the last visit: do not write them back while doing so */
@@ -67,10 +77,14 @@
 	let history = $state.raw<InflowSample[]>([]);
 	let historyOf: Simulation | null = null;
 	let showInflows = $state(false);
+	/** pedestrians per hour on every footpath (the network files give no demand for them) */
+	let pedestriansPerHour = $state(DEFAULT_PEDESTRIANS_PER_HOUR);
+	let footpaths = $state(0);
 	let ui = $state({
 		time: 0,
 		period: 0,
 		vehicles: 0,
+		pedestrians: 0,
 		finished: false,
 		groups: [] as { key: number; name: string; state: SignalState }[],
 		inputs: [] as { no: number; link: number; volume: number; entered: number; waiting: number; left: number; delay: number }[],
@@ -82,7 +96,8 @@
 		ui = {
 			time: sim.time,
 			period: rt.net.simulation.period,
-			vehicles: sim.vehicles.length,
+			vehicles: sim.vehicles.filter((v) => v.category !== 'PEDESTRIAN').length,
+			pedestrians: sim.vehicles.filter((v) => v.category === 'PEDESTRIAN').length,
 			finished: sim.finished,
 			groups: rt.net.controllers.flatMap((c) => c.groups.map((g) => ({ key: Simulation.signalKey(c.no, g.no), name: g.name || `SG ${g.no}`, state: sim!.signals.get(Simulation.signalKey(c.no, g.no)) ?? 'off' }))),
 			inputs: sim.inputStats.map((s) => ({ no: s.input.no, link: s.input.link, volume: s.input.volume, entered: s.entered, waiting: s.waiting, left: s.left, delay: s.left ? s.delay / s.left : 0 })),
@@ -114,19 +129,42 @@
 	async function vaUpload(files: FileList | null): Promise<void> {
 		vaError = '';
 		try {
-			upload = await readUpload([...(files ?? [])]);
-			uploadNames = [upload.exe, ...upload.supply, ...upload.extra].map((f) => f.name).join(', ');
-			void remember.controller({ program: upload, active: false });
+			vaShow(await readUpload([...(files ?? [])]));
+			vaRemember(false);
 		} catch (e) {
 			upload = null;
 			uploadNames = '';
+			vaPrograms = [];
 			vaError = e instanceof Error ? e.message : String(e);
 		}
 	}
 
+	/** Takes over an uploaded controller program: file names and its signal programs. */
+	function vaShow(program: UploadedProgram): void {
+		upload = program;
+		uploadNames = [program.exe, ...program.supply, ...program.extra].map((f) => f.name).join(', ');
+		const vsg = program.supply.find((f) => /\.vsg$/i.test(f.name));
+		vaPrograms = vsg ? readSignalProgramsOf(vsg.data) : [];
+		if (vaPrograms.length && !vaPrograms.some((p) => p.no === vaProgNo)) vaProgNo = vaPrograms[0].no;
+	}
+
+	function vaRemember(active: boolean): void {
+		if (upload) void remember.controller({ program: upload, active, progNo: vaProgNo, startAt: vaStartAt });
+	}
+
 	function vaConnectEmulated(): void {
 		const controller = rt?.net.controllers[0];
-		if (controller && upload) void vaConnect(new EmulatorTransport(upload, controller.no));
+		if (!Number.isInteger(vaProgNo) || vaProgNo < 1) vaProgNo = vaDefaults.progNo;
+		if (!vaStartAt) vaStartAt = vaDefaults.startAt;
+		if (controller && upload) void vaConnect(new EmulatorTransport(upload, controller.no, vaStartAt));
+	}
+
+	/** A setting of the controller changed: it applies from the start, so a running
+	 * controller starts again. */
+	function vaChange(set: () => void): void {
+		set();
+		if (vaActive) vaConnectEmulated();
+		else vaRemember(false);
 	}
 
 	/** Starts the controller program (again) and a fresh simulation under its control. */
@@ -140,18 +178,23 @@
 		vaConnecting = true;
 		vaError = '';
 		running = false;
+		// The simulation that ran so far is over: nothing of it may reach the controller
+		// that is starting, and its open exchange ends without counting as a failure.
+		va = null;
+		vaBusy = false;
 		if (transport && transport !== using) transport.stop();
 		transport = using;
-		const next = new Simulation(rt, sigs);
-		const bridge = new VaBridge(next, controller);
+		const next = new Simulation(rt, sigs, { pedestriansPerHour });
+		const bridge = new VaBridge(next, controller, vaProgNo);
 		try {
-			vaNotes = await using.start(bridge.setup());
 			sim = next;
+			snapshot();
+			vaNotes = await using.start(bridge.setup());
 			va = bridge;
 			vaBusy = false;
 			vaActive = true;
 			vaLabel = using.label;
-			if (upload) void remember.controller({ program: upload, active: true });
+			vaRemember(true);
 			restartNotes();
 			snapshot();
 		} catch (e) {
@@ -168,7 +211,7 @@
 		running = false;
 		transport?.stop();
 		transport = null;
-		if (upload) void remember.controller({ program: upload, active: false });
+		vaRemember(false);
 		restart();
 	}
 
@@ -218,6 +261,7 @@
 		}
 		for (const s of rt.net.skipped) list.push(`Nicht simuliert: ${s.section} (${s.count} Objekte)`);
 		notes = list;
+		noProgram = sim.uncontrolled.length > 0;
 	}
 
 	function restart(): void {
@@ -227,7 +271,7 @@
 			return;
 		}
 		va = null;
-		sim = new Simulation(rt, sigs);
+		sim = new Simulation(rt, sigs, { pedestriansPerHour });
 		restartNotes();
 		snapshot();
 	}
@@ -248,6 +292,10 @@
 					transport?.stop();
 					transport = null;
 				}
+				vaDefaults = { progNo: rt.net.controllers[0]?.progNo ?? 1, startAt: defaultStartAt(rt.net.simulation.startTime) };
+				vaProgNo = vaDefaults.progNo;
+				vaStartAt = vaDefaults.startAt;
+				footpaths = rt.pedestrianLinks.length;
 				const all = [...rt.links.values()];
 				info = { links: all.filter((l) => !l.connector).length, connectors: all.filter((l) => l.connector).length, heads: rt.net.signalHeads.length, detectors: rt.detectors.length, zones: rt.zones.length, version: rt.net.version };
 				if (canvas) view = fitView(rt, canvas.clientWidth || 800, canvas.clientHeight || 600);
@@ -333,8 +381,9 @@
 			}
 		}
 		if (controller) {
-			upload = controller.program;
-			uploadNames = [upload.exe, ...upload.supply, ...upload.extra].map((f) => f.name).join(', ');
+			if (controller.progNo) vaProgNo = controller.progNo;
+			vaShow(controller.program);
+			if (controller.startAt) vaStartAt = controller.startAt;
 			if (controller.active && rt) vaConnectEmulated();
 		}
 	}
@@ -363,7 +412,8 @@
 			}
 			const elapsed = Math.min(0.1, (now - last) / 1000);
 			last = now;
-			if (sim && running && speed === MAX) {
+			if (vaConnecting) debt = 0;
+			else if (sim && running && speed === MAX) {
 				debt = 0;
 				if (!vaBusy) burst();
 			} else if (sim && running) {
@@ -423,6 +473,22 @@
 	const btn = 'inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-sm hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-transparent';
 </script>
 
+{#snippet vaSettings()}
+	<div class="mt-2 grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1.5 text-xs text-slate-300">
+		<label for="va-prog" title="Das Signalprogramm, das die Steuerung fahren soll. Vorgabe aus der Netzdatei.">Signalprogramm</label>
+		{#if vaPrograms.length}
+			<select id="va-prog" class="rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5" value={vaProgNo} onchange={(e) => vaChange(() => (vaProgNo = +e.currentTarget.value))}>
+				{#each vaPrograms as p (p.no)}<option value={p.no}>{p.no}{p.name ? ` – ${p.name}` : ''}{p.no === vaDefaults.progNo ? ' (Netzdatei)' : ''}</option>{/each}
+			</select>
+		{:else}
+		<input id="va-prog" class="w-16 rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-right tabular-nums" type="number" min="1" max="99" step="1" value={vaProgNo} onchange={(e) => vaChange(() => (vaProgNo = Math.max(1, Math.round(+e.currentTarget.value) || vaDefaults.progNo)))} />
+		{/if}
+		<label for="va-start" title="Datum und Uhrzeit, die das Steuerungsprogramm als Rechneruhr sieht. Vorgabe: heute, Startzeit aus der Netzdatei.">Startzeit</label>
+		<input id="va-start" class="rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 [color-scheme:dark]" type="datetime-local" value={vaStartAt} onchange={(e) => vaChange(() => (vaStartAt = e.currentTarget.value || vaDefaults.startAt))} />
+	</div>
+	{#if vaActive}<p class="mt-1 text-xs text-slate-500">Eine Änderung startet Steuerung und Simulation neu.</p>{/if}
+{/snippet}
+
 {#if showInflows}
 	<InflowCharts rows={ui.inputs} {history} time={ui.time} onclose={() => (showInflows = false)} />
 {/if}
@@ -443,7 +509,7 @@
 		</label>
 		{#if hasSample}<button class={btn} onclick={openSample} title="Das Beispielnetz aus static/samples laden">Beispiel</button>{/if}
 		<span class="mx-1 h-5 w-px bg-slate-600"></span>
-		<button class={btn} disabled={!fileName || ui.finished} onclick={() => (running = !running)}>
+		<button class={btn} disabled={!fileName || ui.finished || vaConnecting} title={vaConnecting ? 'Die Steuerung wird geladen…' : undefined} onclick={() => (running = !running)}>
 			<span class="material-symbols-outlined text-[18px]">{running ? 'pause' : 'play_arrow'}</span>{running ? 'Pause' : 'Start'}
 		</button>
 		<button class={btn} disabled={!fileName} onclick={() => { running = false; restart(); }}>
@@ -463,7 +529,7 @@
 		<div class="ml-auto flex items-center gap-4 px-2 text-sm tabular-nums text-slate-300">
 			{#if fileName}
 				<span>Zeit {clock(ui.time)} / {clock(ui.period)}{ui.finished ? ' · beendet' : ''}</span>
-				<span>{ui.vehicles} Fahrzeuge</span>
+				<span>{ui.vehicles} Fahrzeuge{footpaths ? `, ${ui.pedestrians} Fußgänger` : ''}</span>
 			{/if}
 			<span class="max-w-64 truncate text-slate-400">{fileName}</span>
 		</div>
@@ -506,10 +572,17 @@
 					<h2 class="mb-1.5 text-xs font-semibold tracking-wide text-slate-400 uppercase">Signalsteuerung</h2>
 					{#if vaActive}
 						<p class="text-slate-300">Verkehrsabhängig: <span class="text-emerald-300">{vaLabel}</span> steuert. Umlaufsekunde {vaCycleSecond}.</p>
+						{@render vaSettings()}
 						{#each vaNotes as n (n)}<p class="mt-1 text-xs text-slate-500">{n}</p>{/each}
 						<button class="mt-2 rounded border border-slate-600 px-2 py-1 text-xs hover:bg-slate-700" onclick={vaDisconnect}>Trennen (zurück zur Festzeit)</button>
 					{:else}
-						<p class="text-slate-300">Festzeit aus der .sig-Datei.</p>
+						{#if vaConnecting}
+							<p class="text-amber-300">Die Steuerung wird geladen…</p>
+						{:else if noProgram}
+							<p class="text-amber-300">Keine Signalsteuerung: Es ist kein Festzeitprogramm (.sig) geladen, die Signalgeber werden ignoriert.</p>
+						{:else}
+							<p class="text-slate-300">Festzeit aus der .sig-Datei.</p>
+						{/if}
 						<details class="mt-2">
 							<summary class="cursor-pointer text-xs text-sky-300">Steuerungsprogramm hochladen (verkehrsabhängige Steuerung)</summary>
 							<div class="mt-2 grid gap-1.5 text-xs">
@@ -519,6 +592,7 @@
 									<input class="hidden" type="file" multiple accept=".exe,.vsg,.vag,.ini,.wtt" onchange={(e) => { void vaUpload(e.currentTarget.files); e.currentTarget.value = ''; }} />
 								</label>
 								{#if uploadNames}<p class="break-words text-slate-300">{uploadNames}</p>{/if}
+								{@render vaSettings()}
 								<button class="rounded bg-sky-600 px-2 py-1.5 hover:bg-sky-500 disabled:opacity-50" disabled={vaConnecting || !uploadNames} onclick={vaConnectEmulated}>{vaConnecting ? 'Steuerung wird geladen…' : 'Starten'}</button>
 							</div>
 						</details>
@@ -543,6 +617,13 @@
 							{/each}
 						</tbody>
 					</table>
+					{#if footpaths}
+						<label class="mt-2 flex items-center gap-2 text-xs text-slate-300" title="Die Netzdatei enthält für die Furten keine Fußgängermengen: Dieser Wert gilt für jede Furt und Richtung.">
+							Fußgänger je Furt
+							<input class="w-16 rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-right tabular-nums" type="number" min="0" max="3000" step="50" value={pedestriansPerHour} onchange={(e) => { pedestriansPerHour = Math.max(0, +e.currentTarget.value || 0); if (sim) sim.pedestriansPerHour = pedestriansPerHour; }} />
+							Pers./h
+						</label>
+					{/if}
 				</section>
 
 				<section class="border-b border-slate-700 p-3">

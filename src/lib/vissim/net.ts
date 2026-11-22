@@ -113,6 +113,9 @@ export interface Runtime {
 	zonesByYieldLink: Map<number, ConflictZone[]>;
 	zones: ConflictZone[];
 	decisionsByLink: Map<number, RDecision[]>;
+	/** footpaths across the road: links without interaction between their users, without vehicle
+	 * input and without a way on – pedestrians walk along them from start to end */
+	pedestrianLinks: RLink[];
 	/** vehicle type → the classes it belongs to */
 	classesOfType: Map<number, number[]>;
 	bounds: { minX: number; minY: number; maxX: number; maxY: number };
@@ -273,6 +276,7 @@ export function buildRuntime(net: Network): Runtime {
 		zonesByYieldLink: group(zones, (z) => z.yieldLink),
 		zones,
 		decisionsByLink: group(decisions, (d) => d.decision.link),
+		pedestrianLinks: [...links.values()].filter((l) => !l.connector && l.behavior.model === 'NOINTERACTION' && !l.out.length && !net.inputs.some((i) => i.link === l.no)),
 		classesOfType,
 		bounds: { minX, minY, maxX, maxY },
 		warnings

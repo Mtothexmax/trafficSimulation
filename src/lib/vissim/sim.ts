@@ -44,6 +44,8 @@ export interface Vehicle {
 	lcOffset: number;
 	/** signal head the vehicle decided to pass at amber */
 	goHead: number;
+	/** sideways offset within the lane (m, to the left): pedestrians do not walk in single file */
+	lateral: number;
 	/** distance to the signal head it is stopping for (Infinity: none) */
 	signalStop: number;
 	input: number;
@@ -89,6 +91,9 @@ export interface DetectorState {
 	/** a vehicle has arrived and the controller has not cleared the memory yet */
 	impulse: boolean;
 }
+
+/** Pedestrians per hour on every footpath when the file gives no demand for them. */
+export const DEFAULT_PEDESTRIANS_PER_HOUR = 150;
 
 const LANE_CHANGE_TIME = 2.5;
 /** Comfortable deceleration (m/s²) vehicles plan their stops with. */
@@ -236,7 +241,13 @@ export class Simulation {
 	readonly external = new Map<number, Map<number, SignalState>>();
 	/** called before the signal states are taken for a step */
 	onSignals: ((time: number) => void) | null = null;
+	/** pedestrians per hour on every footpath (the network files carry no pedestrian demand for
+	 * these links); can be changed while the simulation runs */
+	pedestriansPerHour: number;
 	private readonly random: () => number;
+	/** own random stream: pedestrians do not change the vehicle traffic */
+	private readonly pedRandom: () => number;
+	private readonly nextPedestrian: number[];
 	private readonly programs = new Map<number, SignalProgram>();
 	private readonly nextArrival: number[];
 	private readonly pending: (Vehicle | null)[];
@@ -245,11 +256,15 @@ export class Simulation {
 
 	constructor(
 		readonly rt: Runtime,
-		sigs: SigFile[] = []
+		sigs: SigFile[] = [],
+		options: { pedestriansPerHour?: number } = {}
 	) {
 		const sim = rt.net.simulation;
 		this.dt = 1 / sim.resolution;
 		this.random = mulberry32(sim.randSeed);
+		this.pedRandom = mulberry32(sim.randSeed + 7919);
+		this.pedestriansPerHour = options.pedestriansPerHour ?? DEFAULT_PEDESTRIANS_PER_HOUR;
+		this.nextPedestrian = rt.pedestrianLinks.map(() => -Math.log(1 - this.pedRandom()) * 20);
 		for (const c of rt.net.controllers) {
 			const program = sigs.find((s) => s.sc === c.no)?.programs[0];
 			if (program) this.programs.set(c.no, program);
@@ -273,7 +288,7 @@ export class Simulation {
 
 	/** Where a vehicle's front and rear are on the map (for drawing). */
 	pose(v: Vehicle): { front: Pose; rear: Pose } {
-		const extra = v.lcTime > 0 ? v.lcOffset * smooth(v.lcTime / LANE_CHANGE_TIME) : 0;
+		const extra = v.lateral + (v.lcTime > 0 ? v.lcOffset * smooth(v.lcTime / LANE_CHANGE_TIME) : 0);
 		return { front: lanePose(v.link, v.lane, v.s, extra), rear: lanePose(v.link, v.lane, v.s - v.length, extra) };
 	}
 
@@ -350,13 +365,41 @@ export class Simulation {
 			vdes: quantile(net.desSpeedDistributions.get(share.desSpeedDistr), q, 50) / 3.6,
 			q, z1: clamp01(0.5 + 0.15 * this.normal()), z2: clamp01(0.5 + 0.15 * this.normal()),
 			link: links.get(input.link)!, lane: 1, s: 0, v: 0, a: 0, path: null, pathIdx: 0, next: null,
-			lcTime: 0, lcOffset: 0, goHead: 0, signalStop: Infinity, input: input.no, born: 0, travelled: 0, segs: []
+			lcTime: 0, lcOffset: 0, lateral: 0, goHead: 0, signalStop: Infinity, input: input.no, born: 0, travelled: 0, segs: []
 		};
 		this.enterLink(v, v.link);
 		return v;
 	}
 
+	/** Pedestrians appear at the start of every footpath, at random intervals. */
+	private spawnPedestrians(): void {
+		const { net } = this.rt;
+		const types = [...net.vehicleTypes.values()].filter((t) => t.category === 'PEDESTRIAN');
+		if (!types.length) return;
+		const walking = [...net.desSpeedDistributions.entries()].find(([no]) => no === 5)?.[1];
+		this.rt.pedestrianLinks.forEach((rl, i) => {
+			if (this.pedestriansPerHour <= 0) {
+				this.nextPedestrian[i] = this.time;
+				return;
+			}
+			while (this.time >= this.nextPedestrian[i]) {
+				this.nextPedestrian[i] += (-Math.log(1 - this.pedRandom()) * 3600) / this.pedestriansPerHour;
+				const type = types[Math.floor(this.pedRandom() * types.length)];
+				const q = this.pedRandom();
+				const room = Math.max(0, (rl.link.lanes[0]?.width ?? 2) / 2 - 0.35);
+				// walking speed: the file's "5 km/h" distribution if it has one, else 4 – 5.8 km/h
+				const vdes = walking ? quantile(walking, q, 5) / 3.6 : 1.1 + 0.5 * q;
+				this.vehicles.push({
+					id: this.nextId++, type, category: 'PEDESTRIAN', length: 0.45, width: 0.5, vdes, q, z1: 0.5, z2: 0.5,
+					link: rl, lane: 1, s: 0, v: vdes, a: 0, path: null, pathIdx: 0, next: null,
+					lcTime: 0, lcOffset: 0, lateral: (this.pedRandom() * 2 - 1) * room, goHead: 0, signalStop: Infinity, input: -1, born: this.time, travelled: 0, segs: []
+				});
+			}
+		});
+	}
+
 	private spawn(): void {
+		this.spawnPedestrians();
 		this.indexLanes();
 		this.inputStats.forEach((st, i) => {
 			while (this.time >= this.nextArrival[i]) {
@@ -653,7 +696,8 @@ export class Simulation {
 		let a = aFree;
 
 		// vehicle in front
-		const lead = this.leader(v);
+		// (no interaction on footpaths: pedestrians walk past each other)
+		const lead = v.link.behavior.model === 'NOINTERACTION' ? null : this.leader(v);
 		if (lead && lead.gap < v.link.behavior.lookAheadDistMax) {
 			const b = v.link.behavior;
 			const { gap, w } = lead;
