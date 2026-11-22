@@ -1,2 +1,8 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/typography';
+
+/* dark from the first paint, before the page has loaded */
+html {
+	background: var(--color-slate-900);
+	color-scheme: dark;
+}

@@ -553,8 +553,8 @@
 			<div bind:this={host3d} class="absolute inset-0" class:hidden={mode !== '3d'}></div>
 			<canvas bind:this={canvas} class:hidden={mode !== '2d'} class="h-full w-full cursor-grab touch-none active:cursor-grabbing" onwheel={onWheel} onpointerdown={onPointerDown} onpointermove={onPointerMove} onpointerup={() => (drag = null)} onpointercancel={() => (drag = null)}></canvas>
 			{#if !fileName}
-				<div class="pointer-events-none absolute inset-0 flex items-center justify-center">
-					<div class="max-w-md rounded-lg border border-dashed border-slate-600 p-8 text-center text-slate-300">
+				<div class="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900">
+					<div class="max-w-md rounded-lg border border-dashed border-slate-600 bg-slate-800 p-8 text-center text-slate-200">
 						<span class="material-symbols-outlined text-5xl text-slate-500">traffic</span>
 						<p class="mt-2 text-lg">Vissim-Netz öffnen</p>
 						<p class="mt-1 text-sm text-slate-400">Eine .inpx-Datei hierher ziehen oder über „Öffnen“ wählen. Die Festzeitprogramme (.sig) gleich mit auswählen.</p>
