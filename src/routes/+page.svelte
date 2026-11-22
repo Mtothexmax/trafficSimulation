@@ -85,6 +85,8 @@
 		period: 0,
 		vehicles: 0,
 		pedestrians: 0,
+		collisions: 0,
+		diffused: 0,
 		finished: false,
 		groups: [] as { key: number; name: string; state: SignalState }[],
 		inputs: [] as { no: number; link: number; volume: number; entered: number; waiting: number; left: number; delay: number }[],
@@ -98,6 +100,8 @@
 			period: rt.net.simulation.period,
 			vehicles: sim.vehicles.filter((v) => v.category !== 'PEDESTRIAN').length,
 			pedestrians: sim.vehicles.filter((v) => v.category === 'PEDESTRIAN').length,
+			collisions: sim.collisions,
+			diffused: sim.diffused,
 			finished: sim.finished,
 			groups: rt.net.controllers.flatMap((c) => c.groups.map((g) => ({ key: Simulation.signalKey(c.no, g.no), name: g.name || `SG ${g.no}`, state: sim!.signals.get(Simulation.signalKey(c.no, g.no)) ?? 'off' }))),
 			inputs: sim.inputStats.map((s) => ({ no: s.input.no, link: s.input.link, volume: s.input.volume, entered: s.entered, waiting: s.waiting, left: s.left, delay: s.left ? s.delay / s.left : 0 })),
@@ -530,6 +534,8 @@
 			{#if fileName}
 				<span>Zeit {clock(ui.time)} / {clock(ui.period)}{ui.finished ? ' · beendet' : ''}</span>
 				<span>{ui.vehicles} Fahrzeuge{footpaths ? `, ${ui.pedestrians} Fußgänger` : ''}</span>
+				{#if ui.collisions}<span class="text-red-300" title="Fahrzeuge, die sich überlappt haben – ein Fehler der Simulation oder fehlende Vorfahrtsregeln im Netz">{ui.collisions} Kollisionen</span>{/if}
+				{#if ui.diffused}<span class="text-amber-300" title="Fahrzeuge, die zu lange auf einen nötigen Fahrstreifenwechsel gewartet haben und aus dem Netz genommen wurden (wie in Vissim, Diffusionszeit der Netzdatei)">{ui.diffused} entfernt</span>{/if}
 			{/if}
 			<span class="max-w-64 truncate text-slate-400">{fileName}</span>
 		</div>

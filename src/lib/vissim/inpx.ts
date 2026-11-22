@@ -170,6 +170,8 @@ export interface DrivingBehavior {
 	name: string;
 	model: 'WIEDEMANN74' | 'WIEDEMANN99' | 'NOINTERACTION';
 	lookAheadDistMax: number;
+	/** how long a vehicle waits for a lane change it needs before it is taken out of the network (s) */
+	diffusTm?: number;
 	standDist: number;
 	w74ax: number;
 	w74bxAdd: number;
@@ -383,6 +385,7 @@ export function parseInpx(text: string): Network {
 			name: str(b, 'name'),
 			model: model === 'WIEDEMANN99' || model === 'NOINTERACTION' ? model : 'WIEDEMANN74',
 			lookAheadDistMax: num(b, 'lookAheadDistMax', 250),
+			diffusTm: num(b, 'diffusTm', 60),
 			standDist: num(b, 'standDist', 0.5),
 			w74ax: num(b, 'w74ax', 2),
 			w74bxAdd: num(b, 'w74bxAdd', 2),

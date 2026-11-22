@@ -62,14 +62,29 @@ export class EmulatorTransport implements VaTransport {
 		this.label = `${program.exe.name} (im Browser emuliert)`;
 	}
 
+	/** the data the running program was initialised with */
+	private loaded = '';
+
 	start(setup: Triple[]): Promise<string[]> {
-		this.stop();
-		const worker = (this.worker = new Worker(new URL('./exe/worker.ts', import.meta.url), { type: 'module' }));
+		// A program that is loaded with the same data only goes back to its state after
+		// initialising; that takes milliseconds, loading takes seconds.
+		const key = JSON.stringify(setup);
+		const again = this.worker !== null && this.loaded === key;
+		if (again) this.endPending();
+		else this.stop();
+		const worker = again ? this.worker! : (this.worker = new Worker(new URL('./exe/worker.ts', import.meta.url), { type: 'module' }));
 		return new Promise<string[]>((resolve, reject) => {
 			this.abortStart = reject;
+			const loadedNow = (): void => {
+				this.loaded = key;
+				this.abortStart = null;
+			};
 			worker.onmessage = (e: MessageEvent<WorkerReply>) => {
 				const m = e.data;
-				if (m.type === 'ready') resolve([`Steuerung geladen in ${(m.loadMs / 1000).toFixed(1)} s`, ...m.notes]);
+				if (m.type === 'ready') {
+					loadedNow();
+					resolve([...(m.loadMs > 0 ? [`Steuerung geladen in ${(m.loadMs / 1000).toFixed(1)} s`] : []), ...m.notes]);
+				}
 				else if (m.type === 'reply') {
 					this.pending.get(m.id)?.resolve(m.triples);
 					this.pending.delete(m.id);
@@ -84,6 +99,10 @@ export class EmulatorTransport implements VaTransport {
 				for (const p of this.pending.values()) p.reject(error);
 				this.pending.clear();
 			};
+			if (again) {
+				worker.postMessage({ type: 'reset' } satisfies WorkerRequest);
+				return;
+			}
 			const files: Record<string, ArrayBuffer> = {};
 			// the worker gets copies: the upload stays usable for a restart
 			for (const f of [...this.program.supply, ...this.program.extra]) files[f.name] = f.data.slice(0);
@@ -117,8 +136,14 @@ export class EmulatorTransport implements VaTransport {
 	stop(): void {
 		this.worker?.terminate();
 		this.worker = null;
+		this.loaded = '';
 		this.abortStart?.(new Error('Die Steuerung wurde beendet'));
 		this.abortStart = null;
+		this.endPending();
+	}
+
+	/** Ends the exchanges that are still open: their answers no longer count. */
+	private endPending(): void {
 		for (const p of this.pending.values()) p.reject(new Error('Die Steuerung wurde beendet'));
 		this.pending.clear();
 	}

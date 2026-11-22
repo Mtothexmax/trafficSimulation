@@ -53,6 +53,7 @@ describe.skipIf(!available)('controller program in the emulator', () => {
 		expect(program.poke('DateiLesen', SETUP)).toBe(true);
 		expect(program.poke('Init', SETUP)).toBe(true);
 		const tInit = performance.now() - t0;
+		const initial = program.snapshot();
 		const picture = new Map(GROUPS.map((sg) => [sg, 2]));
 		const pictures: [number, Triple[]][] = [];
 		let firstDifference = 0;
@@ -71,6 +72,21 @@ describe.skipIf(!available)('controller program in the emulator', () => {
 		expect(firstDifference).toBe(0);
 		expect(pictures).toEqual(recording.pictures);
 		expect(pictures.length).toBeGreaterThan(3);
+
+		// back to the state after Init: the program answers the same again, without loading
+		const t2 = performance.now();
+		program.restore(initial);
+		const tRestore = performance.now() - t2;
+		for (const sg of GROUPS) picture.set(sg, 2);
+		let secondDifference = 0;
+		for (let sec = 1; sec <= recording.hashes.length; sec++) {
+			expect(program.poke('Rechnen', step(sec, picture))).toBe(true);
+			const reply = program.request('Wunschbild');
+			for (const [code, sg, v] of reply) if (code === 2002 || code === 2003) picture.set(sg, v);
+			if (!secondDifference && hash(reply) !== recording.hashes[sec - 1]) secondDifference = sec;
+		}
+		console.log(`emulator: restore ${tRestore.toFixed(0)} ms`);
+		expect(secondDifference).toBe(0);
 	}, 300000);
 });
 

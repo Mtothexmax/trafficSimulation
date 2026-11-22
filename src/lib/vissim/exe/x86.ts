@@ -48,6 +48,12 @@ function regWrite(i: number, size: number, value: string): string {
 	return i < 4 ? `r[${i}]=(r[${i}]&-256)|((${value})&255);` : `r[${i - 4}]=(r[${i - 4}]&-65281)|(((${value})&255)<<8);`;
 }
 
+export interface CpuState {
+	r: Int32Array;
+	st: Float64Array;
+	n: number[];
+}
+
 export class X86 {
 	readonly mem: Uint8Array;
 	readonly dv: DataView;
@@ -76,6 +82,20 @@ export class X86 {
 
 	private readonly code: (Op | undefined)[];
 	private p = 0; // decode position
+
+	/** The processor state (registers, flags, x87), to return to it later with `restore`.
+	 * Memory is the owner's part; the translated code stays valid as the program does not change. */
+	snapshot(): CpuState {
+		return { r: this.r.slice(), st: this.st.slice(), n: [this.eip, this.cf, this.of, this.df, this.lr, this.explicit ? 1 : 0, this.ezf, this.esf, this.epf, this.top, this.fcw, this.fsw] };
+	}
+
+	restore(s: CpuState): void {
+		this.r.set(s.r);
+		this.st.set(s.st);
+		[this.eip, this.cf, this.of, this.df, this.lr, , this.ezf, this.esf, this.epf, this.top, this.fcw, this.fsw] = s.n;
+		this.explicit = s.n[5] === 1;
+		this.running = false;
+	}
 
 	constructor(
 		buffer: ArrayBuffer,

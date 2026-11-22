@@ -7,7 +7,7 @@
 // Verified against the real program: see experiments/exe-emulator (the Python
 // prototype this is a port of) and program.test.ts.
 import { parsePe, type PeFile } from './pe';
-import { X86 } from './x86';
+import { X86, type CpuState } from './x86';
 
 export type Triple = [number, number, number];
 
@@ -35,6 +35,19 @@ interface OpenFile {
 	append: boolean;
 	eof: boolean;
 	unget: number;
+}
+
+export interface ProgramState {
+	mem: Uint8Array;
+	cpu: CpuState;
+	fs: Map<string, Uint8Array>;
+	free: Map<number, number[]>;
+	files: Map<number, OpenFile>;
+	hsz: Map<string, number>;
+	ddeData: Map<number, Uint8Array>;
+	ddeGuest: Map<number, number>;
+	log: string[];
+	n: number[];
 }
 
 export class ProgramExit extends Error {}
@@ -263,6 +276,43 @@ export class ControllerProgram {
 	}
 
 	/** Starts the program: runtime initialisation, then WinMain up to its message loop. */
+	/** The whole state of the program as it is now. `restore` returns to it: a controller
+	 * that was loaded and initialised once can start again without loading. */
+	snapshot(): ProgramState {
+		return {
+			mem: this.mem.slice(),
+			cpu: this.cpu.snapshot(),
+			fs: new Map([...this.fs].map(([k, v]) => [k, v.slice()])),
+			free: new Map([...this.free].map(([k, v]) => [k, [...v]])),
+			files: new Map([...this.files].map(([k, v]) => [k, { ...v }])),
+			hsz: new Map(this.hsz),
+			ddeData: new Map([...this.ddeData].map(([k, v]) => [k, v.slice()])),
+			ddeGuest: new Map(this.ddeGuest),
+			log: [...this.log],
+			n: [this.brk, this.nextHandle, this.ddeCallback, this.wndProc, this.destroyed ? 1 : 0]
+		};
+	}
+
+	restore(s: ProgramState): void {
+		this.mem.set(s.mem);
+		this.cpu.restore(s.cpu);
+		const fill = <K, V>(to: Map<K, V>, from: Map<K, V>, copy: (v: V) => V): void => {
+			to.clear();
+			for (const [k, v] of from) to.set(k, copy(v));
+		};
+		fill(this.fs, s.fs, (v) => v.slice());
+		fill(this.free, s.free, (v) => [...v]);
+		fill(this.files, s.files, (v) => ({ ...v }));
+		fill(this.hsz, s.hsz, (v) => v);
+		fill(this.ddeData, s.ddeData, (v) => v.slice());
+		fill(this.ddeGuest, s.ddeGuest, (v) => v);
+		this.log.length = 0;
+		this.log.push(...s.log);
+		this.continuations.length = 0;
+		[this.brk, this.nextHandle, this.ddeCallback, this.wndProc] = s.n;
+		this.destroyed = s.n[4] === 1;
+	}
+
 	start(): void {
 		this.call(this.symbol('__pei386_runtime_relocator'));
 		this.call(this.symbol('___main'));

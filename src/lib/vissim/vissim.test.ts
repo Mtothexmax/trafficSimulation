@@ -279,8 +279,8 @@ describe.skipIf(!haveSamples)('pedestrians', () => {
 	}, 20_000);
 
 	it('does not change the vehicle traffic, and can be switched off', () => {
-		const withPeds = run(200);
-		const without = run(200, 0);
+		const withPeds = run(200, 150);
+		const without = run(200); // none unless asked for
 		const cars = (s: Simulation): number[][] => s.vehicles.filter((v) => v.category !== 'PEDESTRIAN').map((v) => [v.type.no, v.link.no]);
 		expect(without.vehicles.some((v) => v.category === 'PEDESTRIAN')).toBe(false);
 		expect(withPeds.vehicles.some((v) => v.category === 'PEDESTRIAN')).toBe(true);

@@ -41,6 +41,8 @@ export interface Vehicle {
 	next: RLink | null;
 	/** lane change in progress: remaining time and lateral offset still to cover */
 	lcTime: number;
+	/** how long the vehicle has been standing because it cannot get onto the lane its route needs (s) */
+	lcWait: number;
 	lcOffset: number;
 	/** signal head the vehicle decided to pass at amber */
 	goHead: number;
@@ -93,7 +95,11 @@ export interface DetectorState {
 }
 
 /** Pedestrians per hour on every footpath when the file gives no demand for them. */
-export const DEFAULT_PEDESTRIANS_PER_HOUR = 150;
+/** how many waiting vehicles of an input may overtake each other on entering */
+const ENTRY_QUEUE = 4;
+/** how far before the lane two merging connectors start to take turns (m) */
+const MERGE_REACH = 40;
+export const DEFAULT_PEDESTRIANS_PER_HOUR = 0;
 
 const LANE_CHANGE_TIME = 2.5;
 /** Comfortable deceleration (m/s²) vehicles plan their stops with. */
@@ -237,6 +243,10 @@ export class Simulation {
 	/** controllers without a signal program: their heads are ignored */
 	readonly uncontrolled: number[] = [];
 	collisions = 0;
+	/** vehicles taken out because they waited too long for a lane change (as Vissim does) */
+	diffused = 0;
+	/** for diagnosis: called for every overlap counted in `collisions` */
+	onCollision?: (v: Vehicle, w: Vehicle, gap: number) => void;
 	/** signal states of externally controlled controllers: controller → group → state */
 	readonly external = new Map<number, Map<number, SignalState>>();
 	/** called before the signal states are taken for a step */
@@ -250,7 +260,8 @@ export class Simulation {
 	private readonly nextPedestrian: number[];
 	private readonly programs = new Map<number, SignalProgram>();
 	private readonly nextArrival: number[];
-	private readonly pending: (Vehicle | null)[];
+	/** the next vehicles of every input, waiting before the network for room on a lane that fits */
+	private readonly pending: Vehicle[][];
 	private lanes = new Map<number, Vehicle[]>();
 	private nextId = 1;
 
@@ -272,7 +283,7 @@ export class Simulation {
 		}
 		this.inputStats = rt.net.inputs.filter((i) => rt.links.has(i.link) && i.volume > 0).map((input) => ({ input, entered: 0, waiting: 0, left: 0, travelTime: 0, delay: 0 }));
 		this.nextArrival = this.inputStats.map((s) => this.headway(s.input.volume));
-		this.pending = this.inputStats.map(() => null);
+		this.pending = this.inputStats.map(() => []);
 		for (const d of rt.detectors) this.detectorStates.set(d.no, { occupied: false, count: 0, changedAt: 0, lastGap: 0, edges: 0, occupiedTime: 0, impulse: false });
 		this.updateSignals();
 	}
@@ -365,7 +376,7 @@ export class Simulation {
 			vdes: quantile(net.desSpeedDistributions.get(share.desSpeedDistr), q, 50) / 3.6,
 			q, z1: clamp01(0.5 + 0.15 * this.normal()), z2: clamp01(0.5 + 0.15 * this.normal()),
 			link: links.get(input.link)!, lane: 1, s: 0, v: 0, a: 0, path: null, pathIdx: 0, next: null,
-			lcTime: 0, lcOffset: 0, lateral: 0, goHead: 0, signalStop: Infinity, input: input.no, born: 0, travelled: 0, segs: []
+			lcTime: 0, lcWait: 0, lcOffset: 0, lateral: 0, goHead: 0, signalStop: Infinity, input: input.no, born: 0, travelled: 0, segs: []
 		};
 		this.enterLink(v, v.link);
 		return v;
@@ -392,7 +403,7 @@ export class Simulation {
 				this.vehicles.push({
 					id: this.nextId++, type, category: 'PEDESTRIAN', length: 0.45, width: 0.5, vdes, q, z1: 0.5, z2: 0.5,
 					link: rl, lane: 1, s: 0, v: vdes, a: 0, path: null, pathIdx: 0, next: null,
-					lcTime: 0, lcOffset: 0, lateral: (this.pedRandom() * 2 - 1) * room, goHead: 0, signalStop: Infinity, input: -1, born: this.time, travelled: 0, segs: []
+					lcTime: 0, lcWait: 0, lcOffset: 0, lateral: (this.pedRandom() * 2 - 1) * room, goHead: 0, signalStop: Infinity, input: -1, born: this.time, travelled: 0, segs: []
 				});
 			}
 		});
@@ -407,31 +418,46 @@ export class Simulation {
 				this.nextArrival[i] += this.headway(st.input.volume);
 			}
 			if (!st.waiting) return;
-			const v = (this.pending[i] ??= this.createVehicle(st.input));
-			if (!v) {
+			// The first few waiting vehicles may enter in any order: one that finds its lane
+			// full does not keep those for the other lanes out.
+			const queue = this.pending[i];
+			while (queue.length < Math.min(st.waiting, ENTRY_QUEUE)) {
+				const made = this.createVehicle(st.input);
+				if (!made) break;
+				queue.push(made);
+			}
+			if (!queue.length) {
 				st.waiting = 0;
 				return;
 			}
-			// lanes the vehicle may use, the ones its route leaves by first
-			const rl = v.link;
-			const lanes: number[] = [];
-			for (let lane = 1; lane <= rl.nLanes; lane++) if (!this.blocked(v, rl, lane)) lanes.push(lane);
-			const wanted = (lane: number): number => (v.next ? Math.max(0, v.next.link.from!.lane - lane, lane - (v.next.link.from!.lane + v.next.nLanes - 1)) : 0);
-			lanes.sort((a, b) => wanted(a) - wanted(b));
-			for (const lane of lanes) {
-				const first = this.lanes.get(laneKey(rl.no, lane))?.[0];
-				const room = first ? first.s - first.length : Infinity;
-				if (room < 3) continue;
-				v.lane = lane;
-				v.s = 0;
-				v.v = Math.min(v.vdes, first ? Math.sqrt(first.v * first.v + 2 * PLAN_DECEL * (room - 3)) : Infinity);
-				v.born = this.time;
-				this.vehicles.push(v);
-				this.pending[i] = null;
-				st.waiting--;
-				st.entered++;
-				this.insertSorted(v);
-				return;
+			for (const v of queue) {
+				// lanes the vehicle may use
+				const rl = v.link;
+				const lanes: number[] = [];
+				for (let lane = 1; lane <= rl.nLanes; lane++) if (!this.blocked(v, rl, lane)) lanes.push(lane);
+				const wanted = (lane: number): number => (v.next ? Math.max(0, v.next.link.from!.lane - lane, lane - (v.next.link.from!.lane + v.next.nLanes - 1)) : 0);
+				lanes.sort((a, b) => wanted(a) - wanted(b));
+				// Only the lanes that fit the route best: a vehicle set onto another lane of a
+				// short, full link blocks it while waiting for a gap it never gets.
+				// (far from the connector there is room to change, any lane will do)
+				const fit = lanes.length ? wanted(lanes[0]) : 0;
+				const near = !!v.next && v.next.link.from!.pos <= rl.link.lnChgDist;
+				while (near && lanes.length && wanted(lanes[lanes.length - 1]) > fit) lanes.pop();
+				for (const lane of lanes) {
+					const first = this.lanes.get(laneKey(rl.no, lane))?.[0];
+					const room = first ? first.s - first.length : Infinity;
+					if (room < 3) continue;
+					v.lane = lane;
+					v.s = 0;
+					v.v = Math.min(v.vdes, first ? Math.sqrt(first.v * first.v + 2 * PLAN_DECEL * (room - 3)) : Infinity);
+					v.born = this.time;
+					this.vehicles.push(v);
+					queue.splice(queue.indexOf(v), 1);
+					st.waiting--;
+					st.entered++;
+					this.insertSorted(v);
+					return;
+				}
 			}
 		});
 	}
@@ -546,14 +572,64 @@ export class Simulation {
 	}
 
 	/** The vehicle in front on the lanes ahead: net gap and the vehicle. */
-	private leader(v: Vehicle): { gap: number; w: Vehicle } | null {
+	private leader(v: Vehicle): { gap: number; w: Vehicle; beside?: boolean } | null {
+		const onPath = this.pathLeader(v);
+		const merging = this.mergeLeader(v);
+		return merging && (!onPath || merging.gap < onPath.gap) ? { ...merging, beside: true } : onPath;
+	}
+
+	/** Where two connectors run into the same lane and the file gives neither priority, the
+	 * vehicles take turns: the one nearer to the lane goes first, the other follows it as if
+	 * it were in front already. */
+	private mergeLeader(v: Vehicle): { gap: number; w: Vehicle } | null {
+		let best: { gap: number; w: Vehicle } | null = null;
+		for (const seg of v.segs) {
+			const c = seg.rl;
+			if (!c.connector) continue;
+			const mine = seg.base + c.length; // to the point where the lane is reached
+			if (mine > MERGE_REACH) break;
+			const to = c.link.to!;
+			const target = this.rt.links.get(to.link);
+			if (!target) continue;
+			const lane = to.lane + seg.lane - 1;
+			for (const other of this.incoming(target)) {
+				const o = other.link.to!;
+				if (other === c || Math.abs(o.pos - to.pos) > 5 || lane < o.lane || lane > o.lane + other.nLanes - 1) continue;
+				if (other.link.from!.link === c.link.from!.link) continue; // they part, they do not merge
+				if (this.hasPriorityRule(c.no, other.no)) continue; // the conflict area settles it
+				for (const w of this.lanes.get(laneKey(other.no, lane - o.lane + 1)) ?? []) {
+					const theirs = other.length - w.s;
+					if (theirs > mine || (theirs === mine && w.id > v.id)) continue;
+					const gap = mine - theirs - w.length;
+					if (!best || gap < best.gap) best = { gap, w };
+				}
+			}
+		}
+		return best;
+	}
+
+	private priorityPairs: Set<number> | null = null;
+	private hasPriorityRule(a: number, b: number): boolean {
+		if (!this.priorityPairs) {
+			this.priorityPairs = new Set();
+			for (const z of this.rt.zones) {
+				this.priorityPairs.add(z.yieldLink * 100000 + z.prioLink);
+				this.priorityPairs.add(z.prioLink * 100000 + z.yieldLink);
+			}
+		}
+		return this.priorityPairs.has(a * 100000 + b);
+	}
+
+	private pathLeader(v: Vehicle): { gap: number; w: Vehicle } | null {
 		for (let i = 0; i < v.segs.length; i++) {
 			const seg = v.segs[i];
 			const l = this.lanes.get(laneKey(seg.rl.no, seg.lane));
 			if (!l) continue;
 			for (const w of l) {
 				if (w === v) continue;
-				const ahead = i === 0 ? w.s > v.s || (w.s === v.s && w.id < v.id) : w.s >= seg.from;
+				// further on, a vehicle that still covers the point where this one gets onto the
+				// lane (it came in by another connector) is in the way too
+				const ahead = i === 0 ? w.s > v.s || (w.s === v.s && w.id < v.id) : w.s >= seg.from - (seg.rl.connector ? 0 : w.length);
 				if (ahead && w.s - w.length < seg.exit) return { gap: seg.base + w.s - w.length, w };
 			}
 		}
@@ -562,6 +638,21 @@ export class Simulation {
 
 	/** Changes to the neighbouring lane towards the lanes the next connector
 	 * leaves by, if there is room. Returns the distance to stop in if not. */
+	private incomingByLink: Map<number, RLink[]> | null = null;
+	/** The connectors that end on a link. */
+	private incoming(rl: RLink): RLink[] {
+		if (!this.incomingByLink) {
+			this.incomingByLink = new Map();
+			for (const c of this.rt.links.values()) {
+				if (!c.connector) continue;
+				const list = this.incomingByLink.get(c.link.to!.link);
+				if (list) list.push(c);
+				else this.incomingByLink.set(c.link.to!.link, [c]);
+			}
+		}
+		return this.incomingByLink.get(rl.no) ?? [];
+	}
+
 	private laneChange(v: Vehicle): number {
 		const next = v.next;
 		if (!next || v.link.connector) return Infinity;
@@ -594,21 +685,54 @@ export class Simulation {
 				gapFront = lead.gap;
 			}
 		}
-		const gapBack = back ? v.s - v.length - back.s : Infinity;
+		let gapBack = back ? v.s - v.length - back.s : Infinity;
+		if (!back) {
+			// nobody behind on this link: someone may be about to enter the lane from a connector
+			for (const c of this.incoming(v.link)) {
+				const to = c.link.to!;
+				if (to.pos > v.s || target < to.lane || target > to.lane + c.nLanes - 1) continue;
+				const l2 = this.lanes.get(laneKey(c.no, target - to.lane + 1));
+				let u = l2?.[l2.length - 1];
+				let behind = u ? c.length - u.s : 0;
+				if (!u) {
+					// connector empty: the next one to take it from the link before
+					const fr = c.link.from!;
+					const l1 = this.lanes.get(laneKey(fr.link, fr.lane + target - to.lane)) ?? [];
+					for (let k = l1.length - 1; k >= 0; k--) {
+						if (l1[k].s > fr.pos || l1[k].next !== c) continue;
+						u = l1[k];
+						behind = c.length + fr.pos - u.s;
+						break;
+					}
+				}
+				if (!u) continue;
+				const gap = v.s - v.length - to.pos + behind;
+				if (gap < gapBack) {
+					gapBack = gap;
+					back = u;
+				}
+			}
+		}
 		const needFront = 1 + (front ? Math.max(0, (v.v * v.v - front.v * front.v) / (2 * 3)) : 0);
 		const needBack = 1 + (back ? Math.max(0, (back.v * back.v - v.v * v.v) / (2 * 3)) + back.v * 0.3 : 0);
-		if (gapFront > needFront && gapBack > needBack && v.lcTime <= 0 && !this.blocked(v, v.link, target)) {
+		// (not before the vehicle is on the link with its whole length)
+		if (gapFront > needFront && gapBack > needBack && v.lcTime <= 0 && (v.s >= v.length || v.input >= 0 && v.travelled < v.length) && !this.blocked(v, v.link, target)) {
 			const old = this.lanes.get(laneKey(v.link.no, v.lane));
 			old?.splice(old.indexOf(v), 1);
 			v.lcOffset = v.link.offsets[v.lane - 1] - v.link.offsets[target - 1];
 			v.lcTime = LANE_CHANGE_TIME;
 			v.lane = target;
 			this.insertSorted(v);
-			if (target >= lo && target <= hi) return Infinity;
+			if (target >= lo && target <= hi) {
+				v.lcWait = 0;
+				return Infinity;
+			}
 		}
 		// still on the wrong lane: wait before the connector until a gap opens
 		const missing = v.lane < lo ? lo - v.lane : v.lane - hi;
-		return Math.max(0, toGo - v.link.link.emergStopDist * missing);
+		const wait = Math.max(0, toGo - v.link.link.emergStopDist * missing);
+		if (v.v < 0.3 && wait < 2) v.lcWait += this.dt;
+		return wait;
 	}
 
 	// ------------------------------------------------------------------ driving
@@ -701,7 +825,11 @@ export class Simulation {
 		if (lead && lead.gap < v.link.behavior.lookAheadDistMax) {
 			const b = v.link.behavior;
 			const { gap, w } = lead;
-			if (gap < -0.05 && w.v + v.v > 0.5) this.collisions++;
+			// (a vehicle on the other connector of a merge is not on this one's lane yet)
+			if (gap < -0.05 && w.v + v.v > 0.5 && !lead.beside) {
+				this.collisions++;
+				this.onCollision?.(v, w, gap);
+			}
 			if (b.model === 'WIEDEMANN99') a = wiedemann99(v.v, Math.max(gap, 0.01), w.v, w.a, aFree, b, aMax);
 			else if (b.model === 'WIEDEMANN74') a = wiedemann74(v.v, Math.max(gap, 0.01), w.v, w.a, aFree, b, v.z1, v.z2);
 			// never faster than what still stops behind the leader
@@ -743,6 +871,12 @@ export class Simulation {
 			v.s += ds;
 			v.travelled += ds;
 			if (v.lcTime > 0) v.lcTime = Math.max(0, v.lcTime - dt);
+			// stuck before its connector for too long: taken out, so the others get on
+			if (v.lcWait > (v.link.behavior.diffusTm ?? 60)) {
+				this.diffused++;
+				gone.add(v);
+				continue;
+			}
 			for (let guard = 0; guard < 4; guard++) {
 				const rl = v.link;
 				if (rl.connector) {
@@ -778,7 +912,7 @@ export class Simulation {
 		if (gone.size) {
 			for (const v of gone) {
 				const st = this.inputStats.find((s) => s.input.no === v.input);
-				if (!st) continue;
+				if (!st || v.lcWait > (v.link.behavior.diffusTm ?? 60)) continue;
 				const t = this.time + dt - v.born;
 				st.left++;
 				st.travelTime += t;
